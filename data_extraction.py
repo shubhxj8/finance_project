@@ -169,8 +169,24 @@ def run_data_pipeline(out_folder="outputs", output_file="nifty_regime_hmm.csv"):
 
     # Merge
     print("🔄 Merging index and futures data...")
-    index_df['timestamp'] = pd.to_datetime(index_df['timestamp']).dt.tz_localize(None)
-    fut_df['timestamp'] = pd.to_datetime(fut_df['timestamp']).dt.tz_localize(None)
+
+    # Ensure timestamps exist and are datetime
+    if 'timestamp' not in index_df.columns or index_df.empty:
+        raise ValueError("Index data missing or empty. Check Yahoo Finance fetch.")
+    if 'timestamp' not in fut_df.columns or fut_df.empty:
+        raise ValueError("Futures data missing or empty. Check NSE fetch.")
+
+    index_df['timestamp'] = pd.to_datetime(index_df['timestamp'], errors='coerce').dt.tz_localize(None)
+    fut_df['timestamp'] = pd.to_datetime(fut_df['timestamp'], errors='coerce').dt.tz_localize(None)
+
+    # Drop any invalid timestamps
+    index_df = index_df.dropna(subset=['timestamp']).sort_values('timestamp')
+    fut_df = fut_df.dropna(subset=['timestamp']).sort_values('timestamp')
+
+    # Merge safely
+    merged = pd.merge_asof(index_df, fut_df, on='timestamp', direction='nearest', suffixes=('', '_fut'))
+
+    print(f"✅ Merged dataset shape: {merged.shape}")
 
     merged = pd.merge_asof(index_df.sort_values('timestamp'),
                            fut_df.sort_values('timestamp'),
