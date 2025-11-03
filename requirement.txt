@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+matplotlib
+plotly
+scikit-learn
+tensorflow
+xgboost
+shap
+imblearn
+yfinance
+nsepython
+hmmlearn
+tqdm
+seaborn
