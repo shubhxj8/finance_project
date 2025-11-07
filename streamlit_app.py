@@ -9,7 +9,7 @@ from datetime import datetime
 
 # Import pipeline functions
 from strategy_pipeline import main as run_strategy_pipeline
-from data_extraction_backup import run_data_pipeline
+from data_extraction import run_data_pipeline
 
 # -------------------------------
 # Streamlit Config
