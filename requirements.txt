@@ -13,3 +13,7 @@ nsepython
 hmmlearn
 tqdm
 seaborn
+stable-baselines3
+gymnasium
+torch
+
