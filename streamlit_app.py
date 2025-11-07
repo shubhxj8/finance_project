@@ -9,7 +9,7 @@ from datetime import datetime
 
 # Import pipeline functions
 from strategy_pipeline import main as run_strategy_pipeline
-from data_extraction import run_data_pipeline
+from data_extraction_backup import run_data_pipeline
 
 # -------------------------------
 # Streamlit Config
@@ -18,7 +18,7 @@ st.set_page_config(page_title="NIFTY Regime Detection Dashboard", layout="wide")
 os.makedirs("outputs", exist_ok=True)
 
 st.markdown("<h1 style='text-align:center;'>📊 NIFTY Regime Detection & Strategy Dashboard</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center;'>Built with ❤️ using HMM, XGBoost, and LSTM</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;'>Built with ❤️ using HMM, XGBoost, and RL</p>", unsafe_allow_html=True)
 
 # -------------------------------
 # Sidebar Controls
@@ -41,6 +41,7 @@ if run_data:
     try:
         run_data_pipeline(output_file=input_csv)
         st.success(f"✅ Data extraction complete! Saved as `{input_csv}`")
+        # input_csv = 'outputs/' + input_csv
         if os.path.exists(input_csv):
             df_preview = pd.read_csv(input_csv)
             st.subheader("📂 New Data Preview")
@@ -73,14 +74,20 @@ def load_csv(file):
 # Load Saved Results (Static Home View)
 # -------------------------------
 index_df = load_csv("bars_with_emas.csv")
-trades_df = load_csv("trades.csv")
-daily_df = load_csv("daily_metrics.csv")
+# trades_df = load_csv("trades.csv")
+# daily_df = load_csv("daily_metrics.csv")
 context_df = load_csv("trade_contexts_with_anomalies.csv")
 option_chain_df = load_csv("option_chain.csv")
 total_oi_df = load_csv("total_oi_timeseries.csv")
 
+train_trades_df = load_csv("train_trades.csv")
+train_daily_df = load_csv("train_daily_metrics.csv")
+test_trades_df = load_csv("test_trades.csv")
+test_daily_df = load_csv("test_daily_metrics.csv")
+
+
 # If nothing exists — show welcome
-if all(df.empty for df in [index_df, trades_df, daily_df, context_df]):
+if all(df.empty for df in [index_df, train_trades_df, train_daily_df, test_trades_df, test_daily_df, context_df]):
     st.info("👋 Welcome! No results yet — click **Run Data Extraction** and then **Run Full Strategy Pipeline** to generate insights.")
     st.stop()
 
@@ -194,32 +201,42 @@ with tabs[1]:
 
 # === 3️⃣ Backtest Performance ===
 with tabs[2]:
-    st.subheader("💹 Backtest Performance")
+    st.subheader("💹 Backtest Performance (Train vs Test)")
 
-    if not trades_df.empty:
-        total_pnl = daily_df['daily_pnl'].sum() if not daily_df.empty else 0
-        sharpe = (daily_df['daily_pnl'].mean() / daily_df['daily_pnl'].std() * (252**0.5)) if not daily_df.empty else 0
-        max_dd = daily_df['daily_pnl'].cumsum().sub(daily_df['daily_pnl'].cumsum().cummax()).min() if not daily_df.empty else 0
-        winrate = trades_df['win'].mean() * 100 if 'win' in trades_df.columns else 0
+    if not (train_trades_df.empty and test_trades_df.empty):
+        for phase_name, trades, daily in [
+            ("Training (First 50%)", train_trades_df, train_daily_df),
+            ("Backtest (Last 50%)", test_trades_df, test_daily_df),
+        ]:
+            if trades.empty or daily.empty:
+                continue
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("💰 Total PNL", f"{total_pnl:,.0f}")
-        col2.metric("⚡ Sharpe", f"{sharpe:.2f}")
-        col3.metric("📉 Max Drawdown", f"{max_dd:,.0f}")
-        col4.metric("🏆 Win Rate", f"{winrate:.1f}%")
+            st.markdown(f"### 📊 {phase_name}")
+            total_pnl = daily['daily_pnl'].sum() if 'daily_pnl' in daily.columns else 0
+            sharpe = (daily['daily_pnl'].mean() / daily['daily_pnl'].std() * (252**0.5)) if 'daily_pnl' in daily.columns and daily['daily_pnl'].std() != 0 else 0
+            max_dd = daily['daily_pnl'].cumsum().sub(daily['daily_pnl'].cumsum().cummax()).min() if 'daily_pnl' in daily.columns else 0
+            winrate = trades['win'].mean() * 100 if 'win' in trades.columns else 0
 
-        st.markdown("---")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("💰 Total PNL", f"{total_pnl:,.0f}")
+            col2.metric("⚡ Sharpe", f"{sharpe:.2f}")
+            col3.metric("📉 Max Drawdown", f"{max_dd:,.0f}")
+            col4.metric("🏆 Win Rate", f"{winrate:.1f}%")
 
-        if not daily_df.empty:
-            daily_df["cum_equity"] = daily_df["daily_pnl"].cumsum()
-            eq_fig = go.Figure()
-            eq_fig.add_trace(go.Scatter(x=daily_df["entry_date"], y=daily_df["cum_equity"], name="Equity Curve"))
-            st.plotly_chart(eq_fig, use_container_width=True)
+            if 'daily_pnl' in daily.columns:
+                daily["cum_equity"] = daily["daily_pnl"].cumsum()
+                eq_fig = go.Figure()
+                eq_fig.add_trace(go.Scatter(x=daily["entry_date"], y=daily["cum_equity"], name="Equity Curve"))
+                eq_fig.update_layout(title=f"{phase_name} Equity Curve")
+                st.plotly_chart(eq_fig, use_container_width=True)
 
-        fig_hist = px.histogram(trades_df, x='pnl', nbins=30, title='Trade P&L Distribution')
-        st.plotly_chart(fig_hist, use_container_width=True)
+            if 'pnl' in trades.columns:
+                fig_hist = px.histogram(trades, x='pnl', nbins=30, title=f'{phase_name} Trade P&L Distribution')
+                st.plotly_chart(fig_hist, use_container_width=True)
+
+            st.markdown("---")
     else:
-        st.info("No trade results available.")
+        st.info("No training or backtest trade results found — run the strategy pipeline first.")
 
 # === 4️⃣ Feature Importance ===
 with tabs[3]:
@@ -243,7 +260,7 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("🤖 Model Metrics Radar")
     models = []
-    for model_name in ["lstm_metrics.json", "xgb_metrics.json"]:
+    for model_name in [r"rl_metrics.json", r"xgb_metrics.json"]:
         path = os.path.join(out_folder, model_name)
         if os.path.exists(path):
             with open(path) as f:
@@ -286,4 +303,4 @@ with tabs[5]:
         st.info("No anomaly data yet — retrain the pipeline to detect anomalies.")
 
 st.markdown("---")
-st.caption("💡 Built with Streamlit, Plotly, HMM, XGBoost, and LSTM.")
+st.caption("💡 Built with Streamlit, Plotly, HMM, XGBoost, and RL.")

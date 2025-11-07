@@ -99,12 +99,38 @@ def build_trade_contexts(df, trades_df, lookback=30, feature_cols=None):
 
 # ---------- Anomaly detection ----------
 def detect_anomalies(context_df, contamination=0.05):
-    feat_cols = [c for c in context_df.columns if c not in ['pnl','success','regime']]
+    from sklearn.ensemble import IsolationForest
+    import numpy as np
+
+    print("🚀 Detecting anomalies (dropping non-numeric columns)...")
+    df = context_df.copy()
+
+    # --- Drop all non-numeric columns automatically ---
+    non_numeric_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    if non_numeric_cols:
+        print(f"⚠️ Dropping non-numeric columns before fitting IsolationForest: {non_numeric_cols}")
+        df = df.drop(columns=non_numeric_cols)
+
+    # --- Drop target-like columns too ---
+    drop_cols = [c for c in ['anomaly', 'anomaly_reason', 'profit_anomaly', 'loss_anomaly'] if c in df.columns]
+    if drop_cols:
+        print(f"⚠️ Dropping derived anomaly columns: {drop_cols}")
+        df = df.drop(columns=drop_cols)
+
+    df = df.fillna(0)
+
+    # --- Numeric features only ---
+    feature_cols = [c for c in df.columns if c not in ['pnl', 'success', 'regime']]
+    X = df[feature_cols].select_dtypes(include=[np.number])
+
+    # --- Fit model ---
     iso = IsolationForest(n_estimators=200, contamination=contamination, random_state=42)
-    X = context_df[feat_cols].fillna(0)
     iso.fit(X)
+
     context_df['anomaly_score'] = iso.decision_function(X)
-    context_df['anomaly'] = iso.predict(X) == -1
+    context_df['anomaly'] = (iso.predict(X) == -1).astype(int)
+
+    print("✅ Anomalies computed successfully.")
     return context_df, iso
 
 # ---------- XGBoost + SHAP ----------
@@ -118,6 +144,9 @@ def explain_with_xgboost(context_df, save_plots=True, out_folder="outputs"):
       - feature_importances.csv
     Returns: model, feature_df (DataFrame of importance)
     """
+    # inside explain_with_xgboost()
+    context_df = context_df.select_dtypes(include=[np.number])
+
     # import os
     # import numpy as np
     # import pandas as pd
@@ -255,209 +284,73 @@ def explain_with_xgboost(context_df, save_plots=True, out_folder="outputs"):
     print("Saved feature importance artifacts to:", out_folder)
     return model, imp_df, perm_df
 
-# ---------- LSTM training (classification) ----------
-def build_lstm_model(input_shape, dropout=0.3, learning_rate=0.0005):
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.layers import Bidirectional
+from stable_baselines3 import PPO
+from rl_environment import TradingEnv
 
-    model = Sequential()
-    model.add(Bidirectional(LSTM(128, return_sequences=True, input_shape=input_shape)))
-    model.add(Dropout(dropout))
-    model.add(BatchNormalization())
-    model.add(LSTM(64, return_sequences=False))
-    model.add(Dropout(dropout))
-    model.add(Dense(32, activation='relu'))
-    model.add(Dropout(dropout))
-    model.add(Dense(1, activation='sigmoid'))
-
-    model.compile(
-        loss='binary_crossentropy',
-        optimizer=Adam(learning_rate=learning_rate),
-        metrics=['AUC', 'accuracy']
-    )
+def train_rl_agent(df, model_path="outputs/ppo_trading_agent.zip"):
+    print("🤖 Training RL trading agent...")
+    env = TradingEnv(df)
+    model = PPO("MlpPolicy", env, verbose=0, n_steps=256, batch_size=64)
+    model.learn(total_timesteps=10000)
+    model.save(model_path)
+    print(f"✅ RL model trained and saved: {model_path}")
     return model
 
+def generate_rl_trades(df, model_path="outputs/ppo_trading_agent.zip"):
+    from stable_baselines3 import PPO
+    from rl_environment import TradingEnv
+    import numpy as np
 
-def build_sequences(df, feature_cols, window=60, horizon=5, threshold_profit=0.0005):
-    Xs, ys, meta = [], [], []
-    arr = df[feature_cols].values
-    for i in range(window, len(df)-horizon-1):
-        X = arr[i-window:i]
-        entry_price = df.loc[i+1, 'open']
-        exit_price = df.loc[i+1+horizon, 'close']
-        ret = (exit_price - entry_price) / entry_price
-        y = 1 if ret > threshold_profit else 0
-        Xs.append(X); ys.append(y); meta.append(df.loc[i+1, 'timestamp'])
-    if len(Xs)==0:
-        return np.empty((0,window,len(feature_cols))), np.array([]), pd.DataFrame()
-    return np.array(Xs), np.array(ys), pd.DataFrame({'timestamp': meta})
+    print("🎯 Generating trades using RL agent...")
 
-def walk_forward_train(df, feature_cols, window=120, horizon=5):
-    from imblearn.over_sampling import SMOTE
-    from sklearn.preprocessing import StandardScaler
-    from tensorflow.keras.callbacks import EarlyStopping
-    from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
-
-    X, y, meta = build_sequences(df, feature_cols, window=window, horizon=horizon)
-    if X.shape[0] == 0:
-        print("No sequences for LSTM (not enough data). Skipping.")
-        return None, None, None
-
-    print(f"🧠 Built {len(X)} sequences for LSTM training")
-    n = len(X)
-    train_end = int(n * 0.7)
-    val_end = int(n * 0.85)
-
-    # Scale features globally
-    X_flat = X.reshape(-1, X.shape[-1])
-    scaler = StandardScaler().fit(X_flat)
-    X_scaled = scaler.transform(X_flat).reshape(X.shape)
-
-    X_train, y_train = X_scaled[:train_end], y[:train_end]
-    X_val, y_val = X_scaled[train_end:val_end], y[train_end:val_end]
-    X_test, y_test = X_scaled[val_end:], y[val_end:]
-
-    # ⚖️ Balance classes with SMOTE
-    y_train_ratio = np.mean(y_train)
-    print(f"🔹 Original train ratio of success={y_train_ratio:.3f}")
     try:
-        sm = SMOTE(random_state=42)
-        X_train_res, y_train_res = sm.fit_resample(X_train.reshape(X_train.shape[0], -1), y_train)
-        X_train = X_train_res.reshape(X_train_res.shape[0], window, len(feature_cols))
-        y_train = y_train_res
-        print(f"✅ After SMOTE: {np.mean(y_train):.3f} positives")
+        model = PPO.load(model_path)
+        env = TradingEnv(df)
+        obs, _ = env.reset()
+        actions = []
+        balances = []
+
+        for _ in range(len(df) - env.window - 1):
+            action, _ = model.predict(obs, deterministic=True)
+
+            # ✅ Convert NumPy array to int safely
+            if isinstance(action, np.ndarray):
+                action = int(action.item())
+
+            obs, reward, done, _, _ = env.step(action)
+            actions.append(action)
+            balances.append(env.balance)
+            if done:
+                break
+
+        # --- Safe padding ---
+        df = df.copy()
+        padded_actions = [np.nan] * env.window + actions
+        padded_balances = [np.nan] * env.window + balances
+
+        # ✅ Align lengths safely
+        if len(padded_actions) < len(df):
+            pad_len = len(df) - len(padded_actions)
+            padded_actions += [np.nan] * pad_len
+            padded_balances += [np.nan] * pad_len
+
+        df["action"] = padded_actions[:len(df)]
+        df["balance"] = padded_balances[:len(df)]
+
+        # ✅ Map actions safely
+        df["signal"] = df["action"].apply(
+            lambda x: {0: "HOLD", 1: "BUY", 2: "SELL"}.get(int(x), np.nan)
+            if pd.notnull(x) else np.nan
+        )
+
+        print("✅ RL trade signals generated successfully.")
+        return df
+
     except Exception as e:
-        print("⚠️ SMOTE skipped:", e)
-
-    # Build model
-    model = build_lstm_model((X.shape[1], X.shape[2]))
-
-    # Train longer with early stopping
-    es = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=150, batch_size=32,
-        callbacks=[es],
-        verbose=1
-    )
-
-    # Evaluate
-    y_pred_proba = model.predict(X_test).ravel()
-    y_pred = (y_pred_proba > 0.5).astype(int)
-    metrics = {
-        'auc': roc_auc_score(y_test, y_pred_proba) if len(y_test) > 0 else None,
-        'accuracy': accuracy_score(y_test, y_pred) if len(y_test) > 0 else None,
-        'precision': precision_score(y_test, y_pred, zero_division=0) if len(y_test) > 0 else None,
-        'recall': recall_score(y_test, y_pred, zero_division=0) if len(y_test) > 0 else None
-    }
-
-    print(f"📊 Test metrics: {metrics}")
-    return model, scaler, metrics
+        print(f"⚠️ RL agent step failed: {e}")
+        return df
 
 # ---------- Orchestrator ----------
-def main_backup(input_csv='nifty_regime_hmm.csv', out_folder='outputs'):
-    import os as osx
-    osx.makedirs(out_folder, exist_ok=True)
-
-    print("Loading data...")
-    df = pd.read_csv(input_csv, parse_dates=['timestamp'])
-    df = df.sort_values('timestamp').reset_index(drop=True)
-
-    # 1. Compute EMAs and signals
-    print("Computing EMAs & signals...")
-    df = compute_emas(df)
-    df = generate_signals(df)
-    df.to_csv(osx.path.join(out_folder, 'bars_with_emas.csv'), index=False)
-
-    # 2. Backtest EMA
-    print("Running backtest...")
-    trades_df, daily_df = backtest_ema(df)
-    trades_path = osx.path.join(out_folder, 'trades.csv')
-    daily_path = osx.path.join(out_folder, 'daily_metrics.csv')
-    trades_df.to_csv(trades_path, index=False)
-    daily_df.to_csv(daily_path, index=False)
-    print(f"Saved trades -> {trades_path} | daily -> {daily_path}")
-
-    if trades_df.empty:
-        print("No trades generated. Stopping pipeline.")
-        return
-
-    # 3. Build trade contexts
-    print("Building trade contexts...")
-    feature_cols = ['return','volatility','ema_5','ema_15','total_OI_change']  # extend as available
-    context_df = build_trade_contexts(df, trades_df, lookback=30, feature_cols=feature_cols)
-    ctx_path = osx.path.join(out_folder, 'trade_contexts.csv')
-    context_df.to_csv(ctx_path, index=False)
-    print(f"Saved trade contexts -> {ctx_path}")
-
-    # 4. Anomaly detection
-    print("Detecting anomalies...")
-    context_df, iso = detect_anomalies(context_df)
-    context_df.to_csv(os.path.join(out_folder, 'trade_contexts_with_anomalies.csv'), index=False)
-
-    # 5. Explain with XGBoost + SHAP
-    print("Training XGBoost and computing SHAP...")
-    # xgb_model, imp_df, perm_df = explain_with_xgboost(context_df)
-    print("Training XGBoost and computing SHAP...")
-
-    # ✅ Ensure target label (success) is correctly set and has variation
-    if "success" not in context_df.columns or context_df["success"].nunique() < 2:
-        print("⚠️ 'success' label missing or constant — regenerating label based on pnl > 0...")
-        context_df["success"] = (context_df["pnl"] > 0).astype(int)
-
-    print("Target value counts:\n", context_df["success"].value_counts(dropna=False))
-
-    # 🚀 Proceed only if we have both 0 and 1
-    if context_df["success"].nunique() >= 2:
-        try:
-            xgb_model, imp_df, perm_df = explain_with_xgboost(context_df)
-            print("\nTop 5 XGBoost features by gain:")
-            print(imp_df.head())
-            print("\nTop 5 Permutation features:")
-            print(perm_df.head())
-        except Exception as e:
-            print("⚠️ XGBoost explanation step failed:", e)
-    else:
-        print("⚠️ Not enough label variation to train XGBoost (all trades same outcome). Skipping step.")
-
-
-    
-    print("XGBoost trained. SHAP ready.")
-
-    # 6. LSTM (optional, may take time)
-    print("Training LSTM (may take several minutes)...")
-    lstm_feature_cols = [
-        'return', 'return_mean', 'return_std',
-        'volatility', 'volatility_mean', 'volatility_std',
-        'ema_5', 'ema_15', 'ema_30',
-        'total_OI_change'
-    ]
-
-    df['return'] = df['close'].pct_change()
-    df['volatility'] = df['return'].rolling(10).std()
-    df['return_mean'] = df['return'].rolling(10).mean()
-    df['return_std'] = df['return'].rolling(10).std()
-    df['volatility_mean'] = df['volatility'].rolling(10).mean()
-    df['volatility_std'] = df['volatility'].rolling(10).std()
-    df['ema_30'] = df['close'].ewm(span=30, adjust=False).mean()
-    df['total_OI_change'] = df['open_interest'].pct_change() if 'open_interest' in df.columns else 0
-
-
-    # lstm_feature_cols = ['return','volatility','ema_5','ema_15','total_OI_change']  # same as above
-    model, scaler, metrics = walk_forward_train(df, lstm_feature_cols, window=60, horizon=5)
-    print("LSTM metrics:", metrics)
-
-    import json
-    out_folder = "outputs"
-    osx.makedirs(out_folder, exist_ok=True)
-    with open(os.path.join(out_folder, "lstm_metrics.json"), "w") as f:
-        json.dump(metrics, f)
-
-    print("✅ LSTM metrics saved to outputs/lstm_metrics.json")
-
-    print("Pipeline finished. Outputs in:", out_folder)
-
 def main(input_csv='nifty_regime_hmm.csv', out_folder='outputs', retrain=True):
     import os as osx
     import json
@@ -475,31 +368,80 @@ def main(input_csv='nifty_regime_hmm.csv', out_folder='outputs', retrain=True):
 
 
     print("📂 Loading data...")
+
     df = pd.read_csv(input_csv, parse_dates=['timestamp'])
     df = df.sort_values('timestamp').reset_index(drop=True)
 
-    # --- EMA + signals ---
+    split_idx = len(df) // 2
+    train_df = df.iloc[:split_idx].reset_index(drop=True)
+    test_df = df.iloc[split_idx:].reset_index(drop=True)
+
     print("📊 Computing EMAs & signals...")
-    df = compute_emas(df)
-    df = generate_signals(df)
+    train_df = compute_emas(train_df)
+    train_df = generate_signals(train_df)
+    test_df = compute_emas(test_df)
+    test_df = generate_signals(test_df)
+
+    # Save both sets
+    train_df.to_csv(os.path.join(out_folder, "train_bars.csv"), index=False)
+    test_df.to_csv(os.path.join(out_folder, "test_bars.csv"), index=False)
+
     df.to_csv(osx.path.join(out_folder, 'bars_with_emas.csv'), index=False)
 
     # --- Backtest ---
     print("💹 Running backtest...")
-    trades_df, daily_df = backtest_ema(df)
-    trades_df.to_csv(osx.path.join(out_folder, 'trades.csv'), index=False)
-    daily_df.to_csv(osx.path.join(out_folder, 'daily_metrics.csv'), index=False)
+    # trades_df, daily_df = backtest_ema(df)
+    # trades_df.to_csv(osx.path.join(out_folder, 'trades.csv'), index=False)
+    # daily_df.to_csv(osx.path.join(out_folder, 'daily_metrics.csv'), index=False)
 
-    if trades_df.empty:
+    print("💹 Running backtest on training data...")
+    train_trades_df, train_daily_df = backtest_ema(train_df)
+    train_trades_df.to_csv(os.path.join(out_folder, "train_trades.csv"), index=False)
+    train_daily_df.to_csv(os.path.join(out_folder, "train_daily_metrics.csv"), index=False)
+
+    if train_trades_df.empty:
         print("⚠️ No trades generated. Stopping pipeline.")
         return
 
     # --- Build trade contexts ---
-    print("🧩 Building trade contexts...")
+    # print("🧩 Building trade contexts...")
+    # feature_cols = ['return', 'volatility', 'ema_5', 'ema_15', 'total_OI_change']
+    # context_df = build_trade_contexts(df, train_trades_df, lookback=30, feature_cols=feature_cols)
+
+    print("🧩 Building trade contexts (train)...")
     feature_cols = ['return', 'volatility', 'ema_5', 'ema_15', 'total_OI_change']
-    context_df = build_trade_contexts(df, trades_df, lookback=30, feature_cols=feature_cols)
-    context_df, iso = detect_anomalies(context_df)
-    context_df.to_csv(osx.path.join(out_folder, 'trade_contexts_with_anomalies.csv'), index=False)
+    train_context_df  = build_trade_contexts(train_df, train_trades_df, lookback=30, feature_cols=feature_cols)
+    # context_df, iso = detect_anomalies(context_df)
+
+    train_context_df.to_csv(osx.path.join(out_folder, 'trade_contexts_with_anomalies.csv'), index=False)
+        # --- Profit-based anomaly detection ---
+    print("🚀 Detecting profit-based outperforming anomalies...")
+
+    if 'pnl' in train_context_df .columns and not train_context_df ['pnl'].empty:
+        mean_pnl = train_context_df ['pnl'].mean()
+        std_pnl = train_context_df ['pnl'].std()
+
+        train_context_df ['profit_anomaly'] = train_context_df ['pnl'] > mean_pnl + 2 * std_pnl
+        train_context_df ['loss_anomaly'] = train_context_df ['pnl'] < mean_pnl - 2 * std_pnl
+
+        train_context_df ['anomaly_reason'] = np.where(
+            train_context_df ['profit_anomaly'], 'Outperforming trade',
+            np.where(train_context_df ['loss_anomaly'], 'Underperforming trade', 'Normal')
+        )
+
+        if 'regime' in train_context_df.columns:
+            train_context_df['regime_pnl_mean'] = train_context_df.groupby('regime')['pnl'].transform('mean')
+            train_context_df['regime_pnl_std'] = train_context_df.groupby('regime')['pnl'].transform('std')
+            train_context_df['regime_profit_anomaly'] = (
+                train_context_df['pnl'] > train_context_df['regime_pnl_mean'] + 2 * train_context_df['regime_pnl_std']
+            )
+
+        print("✅ Profit-based anomalies detected and labeled.")
+    else:
+        print("⚠️ Skipping profit anomaly detection (no pnl data).")
+
+    # Save updated context with anomalies
+    train_context_df.to_csv(osx.path.join(out_folder, 'trade_contexts_with_anomalies.csv'), index=False)
 
     # --- XGBoost step ---
     print("⚙️ XGBoost step starting...")
@@ -510,56 +452,155 @@ def main(input_csv='nifty_regime_hmm.csv', out_folder='outputs', retrain=True):
         xgb_model = xgb.XGBClassifier()
         xgb_model.load_model(xgb_model_path)
     else:
+        
+    # --- LSTM step ---
+        context_df, iso = detect_anomalies(train_context_df)
+
+        context_df.to_csv(osx.path.join(out_folder, 'trade_contexts_with_anomalies.csv'), index=False)
+            # --- Profit-based anomaly detection ---
+        print("🚀 Detecting profit-based outperforming anomalies...")
+
+        if 'pnl' in context_df.columns and not context_df['pnl'].empty:
+            mean_pnl = context_df['pnl'].mean()
+            std_pnl = context_df['pnl'].std()
+
+            context_df['profit_anomaly'] = context_df['pnl'] > mean_pnl + 2 * std_pnl
+            context_df['loss_anomaly'] = context_df['pnl'] < mean_pnl - 2 * std_pnl
+
+            context_df['anomaly_reason'] = np.where(
+                context_df['profit_anomaly'], 'Outperforming trade',
+                np.where(context_df['loss_anomaly'], 'Underperforming trade', 'Normal')
+            )
+
+            if 'regime' in context_df.columns:
+                context_df['regime_pnl_mean'] = context_df.groupby('regime')['pnl'].transform('mean')
+                context_df['regime_pnl_std'] = context_df.groupby('regime')['pnl'].transform('std')
+                context_df['regime_profit_anomaly'] = (
+                    context_df['pnl'] > context_df['regime_pnl_mean'] + 2 * context_df['regime_pnl_std']
+                )
+
+            print("✅ Profit-based anomalies detected and labeled.")
+        else:
+            print("⚠️ Skipping profit anomaly detection (no pnl data).")
+
+        # Save updated context with anomalies
+        context_df.to_csv(osx.path.join(out_folder, 'trade_contexts_with_anomalies.csv'), index=False)
+
+        # --- XGBoost step ---
+        print("⚙️ XGBoost step starting...")
+        xgb_model_path = osx.path.join(out_folder, "xgb_model.json")
         print("🧠 Training new XGBoost model...")
+
         if "success" not in context_df.columns or context_df["success"].nunique() < 2:
             print("⚠️ 'success' missing or constant; regenerating from pnl>0.")
             context_df["success"] = (context_df["pnl"] > 0).astype(int)
+
         if context_df["success"].nunique() >= 2:
             try:
+                # --- Clean non-numeric columns before XGBoost ---
+                non_numeric_cols = context_df.select_dtypes(exclude=[np.number]).columns.tolist()
+                if non_numeric_cols:
+                    print(f"⚠️ Dropping non-numeric columns before XGBoost: {non_numeric_cols}")
+                    context_df = context_df.drop(columns=non_numeric_cols)
+
                 xgb_model, imp_df, perm_df = explain_with_xgboost(context_df)
                 xgb_model.save_model(xgb_model_path)
+                # ==========================================================
+                # 📊 Save XGBoost evaluation metrics
+                # ==========================================================
+                from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+                import json
+
+                print("📈 Evaluating XGBoost performance...")
+
+                # Get test split and predictions (reuse same data split as explain_with_xgboost)
+                feature_cols = [c for c in context_df.columns if c not in ['pnl','success','regime','anomaly','anomaly_score']]
+                X = context_df[feature_cols].fillna(0)
+                y = context_df['success'].astype(int)
+
+                # Use last 25% as test (same split logic)
+                split = int(len(X) * 0.75)
+                X_train, X_test = X.iloc[:split], X.iloc[split:]
+                y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+                y_pred = xgb_model.predict(X_test)
+
+                xgb_metrics = {
+                    "accuracy": float(accuracy_score(y_test, y_pred)),
+                    "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+                    "recall": float(recall_score(y_test, y_pred, zero_division=0)),
+                    "f1_score": float(f1_score(y_test, y_pred, zero_division=0))
+                }
+
+                metrics_path = os.path.join(out_folder, "xgb_metrics.json")
+                with open(metrics_path, "w") as f:
+                    json.dump(xgb_metrics, f, indent=4)
+
+                print(f"✅ XGBoost metrics saved → {metrics_path}")
             except Exception as e:
                 print("⚠️ XGBoost failed:", e)
         else:
             print("⚠️ Not enough label variation. Skipping XGBoost training.")
 
-    # --- LSTM step ---
-    print("🤖 LSTM step starting...")
-    lstm_model_path = osx.path.join(out_folder, "lstm_model.keras")
-    lstm_metrics_path = osx.path.join(out_folder, "lstm_metrics.json")
+        # --- Reinforcement Learning step ---
+        print("🤖 Training Reinforcement Learning (RL) agent...")
+        try:
+            rl_model_path = osx.path.join(out_folder, "ppo_trading_agent.zip")
+            model = train_rl_agent(train_df, model_path=rl_model_path)
+            df_rl = generate_rl_trades(test_df, model_path=rl_model_path)
+            df_rl.to_csv(osx.path.join(out_folder, "rl_trades.csv"), index=False)
+            print("✅ RL trades generated and saved → rl_trades.csv")
+            # ==========================================================
+            # 📊 Evaluate RL Agent Performance
+            # ==========================================================
+            print("📊 Evaluating RL agent performance...")
 
-    if not retrain and osx.path.exists(lstm_model_path) and osx.path.exists(lstm_metrics_path):
-        print("📦 Using existing LSTM model and metrics.")
-        with open(lstm_metrics_path, 'r') as f:
-            metrics = json.load(f)
-    else:
-        print("🧠 Training new LSTM model...")
-        # Build features
-        df['return'] = df['close'].pct_change()
-        df['volatility'] = df['return'].rolling(10).std()
-        df['return_mean'] = df['return'].rolling(10).mean()
-        df['return_std'] = df['return'].rolling(10).std()
-        df['volatility_mean'] = df['volatility'].rolling(10).mean()
-        df['volatility_std'] = df['volatility'].rolling(10).std()
-        df['ema_30'] = df['close'].ewm(span=30, adjust=False).mean()
-        df['total_OI_change'] = (
-            df['open_interest'].pct_change() if 'open_interest' in df.columns else 0
-        )
+            try:
+                total_rewards = []
+                num_eval_episodes = 5
 
-        lstm_feature_cols = [
-            'return', 'return_mean', 'return_std',
-            'volatility', 'volatility_mean', 'volatility_std',
-            'ema_5', 'ema_15', 'ema_30', 'total_OI_change'
-        ]
+                env_eval = TradingEnv(test_df)
+                for i in range(num_eval_episodes):
+                    obs, _ = env_eval.reset()
+                    episode_reward = 0
 
-        model, scaler, metrics = walk_forward_train(df, lstm_feature_cols, window=60, horizon=5)
-        if model:
-            model.save(lstm_model_path)
-        with open(lstm_metrics_path, "w") as f:
-            json.dump(metrics, f)
+                    for _ in range(len(test_df) - env_eval.window - 1):
+                        action, _ = model.predict(obs, deterministic=True)
+                        obs, reward, done, _, _ = env_eval.step(int(action))
+                        episode_reward += reward
+                        if done:
+                            break
+                    total_rewards.append(episode_reward)
 
-        print(f"✅ LSTM metrics: {metrics}")
-    
+                rl_metrics = {
+                    "average_reward": float(np.mean(total_rewards)),
+                    "max_reward": float(np.max(total_rewards)),
+                    "min_reward": float(np.min(total_rewards)),
+                    "episodes": num_eval_episodes
+                }
+
+                metrics_path = os.path.join(out_folder, "rl_metrics.json")
+                with open(metrics_path, "w") as f:
+                    json.dump(rl_metrics, f, indent=4)
+
+                print(f"✅ RL metrics saved → {metrics_path}")
+
+            except Exception as e:
+                print(f"⚠️ RL evaluation failed: {e}")
+
+
+            if "pnl" in train_context_df.columns:
+                train_context_df["rl_signal"] = df_rl["signal"]
+                train_context_df.to_csv(osx.path.join(out_folder, "trade_contexts_with_anomalies.csv"), index=False)
+        except Exception as e:
+            print("⚠️ RL agent step failed:", e)
+
+        print("💹 Running backtest on test data...")
+        test_trades_df, test_daily_df = backtest_ema(test_df)
+        test_trades_df.to_csv(os.path.join(out_folder, "test_trades.csv"), index=False)
+        test_daily_df.to_csv(os.path.join(out_folder, "test_daily_metrics.csv"), index=False)
+
+
         # ==========================================================
         # 📊 STEP 7: Option Chain + OI Analytics (for Streamlit dashboard)
         # ==========================================================
