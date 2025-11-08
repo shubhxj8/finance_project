@@ -12,7 +12,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
 
-# ---------- Backtest helpers (same as earlier) ----------
+# ---------- Backtest helpers ----------
 def compute_emas(df, span_fast=5, span_slow=15):
     df = df.copy()
     df['ema_5'] = df['close'].ewm(span=span_fast, adjust=False).mean()
