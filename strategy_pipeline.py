@@ -287,14 +287,18 @@ def explain_with_xgboost(context_df, save_plots=True, out_folder="outputs"):
 from stable_baselines3 import PPO
 from rl_environment import TradingEnv
 
+from stable_baselines3.common.vec_env import DummyVecEnv
+
 def train_rl_agent(df, model_path="outputs/ppo_trading_agent.zip"):
     print("🤖 Training RL trading agent...")
-    env = TradingEnv(df)
-    model = PPO("MlpPolicy", env, verbose=0, n_steps=256, batch_size=64)
-    model.learn(total_timesteps=10000)
+    env = DummyVecEnv([lambda: TradingEnv(df)])  # Multi-instance wrapper
+    model = PPO("MlpPolicy", env, verbose=0, n_steps=512, batch_size=128, learning_rate=3e-4)
+    model.learn(total_timesteps=50000)
     model.save(model_path)
     print(f"✅ RL model trained and saved: {model_path}")
     return model
+
+
 
 def generate_rl_trades(df, model_path="outputs/ppo_trading_agent.zip"):
     from stable_baselines3 import PPO
@@ -562,7 +566,14 @@ def main(input_csv='nifty_regime_hmm.csv', out_folder='outputs', retrain=True):
                 env_eval = TradingEnv(test_df)
                 for i in range(num_eval_episodes):
                     obs, _ = env_eval.reset()
-                    episode_reward = 0
+                    episode_reward = 0.0
+                    done = False
+                    while not done:
+                        action, _ = model.predict(obs, deterministic=True)
+                        obs, reward, done, _, _ = env_eval.step(int(action))
+                        episode_reward += reward
+                    total_rewards.append(episode_reward)
+
 
                     for _ in range(len(test_df) - env_eval.window - 1):
                         action, _ = model.predict(obs, deterministic=True)
