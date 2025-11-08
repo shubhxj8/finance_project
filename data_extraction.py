@@ -42,6 +42,23 @@ def load_equity_data(folder_path):
     df = df.dropna(subset=["timestamp"])
     return df
 
+def clean_final_dataset(df):
+    """Final cleaning step for consistent and anomaly-free dataset."""
+    df = df.copy()
+
+    for col in ["open", "high", "low", "close", "oi"]:
+        if col in df.columns:
+            df = df[(df[col] > 0) & (df[col] < df[col].quantile(0.999))]
+
+    if "return" in df.columns:
+        df["return"] = df["return"].clip(-0.1, 0.1)
+
+    df = df.fillna(method="ffill").fillna(method="bfill")
+
+    df = df.drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
+
+    return df
+
 
 def load_futures_data(folder_path):
     """Load and concatenate all Nifty futures CSVs."""
@@ -183,6 +200,7 @@ def run_data_pipeline(
     index_df.to_csv(paths["index"], index=False)
     fut_df.to_csv(paths["futures"], index=False)
     oc_df.to_csv(paths["option_chain"], index=False)
+    hmm_df = clean_final_dataset(hmm_df)
     hmm_df.to_csv(paths["another_regime_path"], index=False)
     hmm_df.to_csv('nifty_regime_hmm.csv', index=False)
     
