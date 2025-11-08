@@ -178,11 +178,19 @@ def run_data_pipeline(
         suffixes=("", "_fut")
     )
 
+    print("🔄 Merging index, futures, and options data...")
+    merged = pd.merge_asof(
+        merged.sort_values("timestamp"),
+        oc_df.sort_values("timestamp")[["timestamp", "total_oi", "total_OI_change"]],
+        on="timestamp"
+    )
+
+
     # 🧮 Compute OI change
     if "oi_fut" in merged.columns:
         merged.rename(columns={"oi_fut": "oi"}, inplace=True)
     merged["oi"] = pd.to_numeric(merged["oi"], errors="coerce").fillna(method="ffill").fillna(0)
-    merged["total_OI_change"] = merged["oi"].diff().fillna(0)
+    # merged["total_OI_change"] = merged["oi"].diff().fillna(0)
     merged.to_csv("merged_data.csv")
     # 🧠 Generate features and detect regimes
     features_df = generate_features(merged)
