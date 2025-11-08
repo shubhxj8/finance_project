@@ -183,7 +183,7 @@ def run_data_pipeline(
         merged.rename(columns={"oi_fut": "oi"}, inplace=True)
     merged["oi"] = pd.to_numeric(merged["oi"], errors="coerce").fillna(method="ffill").fillna(0)
     merged["total_OI_change"] = merged["oi"].diff().fillna(0)
-
+    merged.to_csv("merged_data.csv")
     # 🧠 Generate features and detect regimes
     features_df = generate_features(merged)
     hmm_df = detect_regimes(features_df, n_states=3)
